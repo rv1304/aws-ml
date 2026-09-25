@@ -30,6 +30,7 @@ def add_normalized(df: pd.DataFrame) -> pd.DataFrame:
     df["name_acronym"] = [n["name_acronym"] for n in names]
     df["name_suffix"] = [n["name_suffix"] for n in names]
     df["name_nospace"] = [n["name_nospace"] for n in names]
+    df["name_type"] = [n["name_type"] for n in names]
     # address needs country for state canon
     addrs = [norm_address(a, c) for a, c in zip(df["business_address"], df["country"])]
     df["addr_norm"] = [a["addr_norm"] for a in addrs]

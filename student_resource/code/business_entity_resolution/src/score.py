@@ -35,6 +35,26 @@ def macro_f05(pred_map: dict, truth_map: dict) -> float:
     return total / len(truth_map)
 
 
+def candidate_recall(candidates: dict, truth_map: dict):
+    """
+    HARD CEILING. Fraction of true (s1,right) pairs that blocking actually retrieved.
+    Matcher can never recover a pair missing from candidates -> this bounds max recall,
+    therefore bounds max macro-F0.5. Returns (micro_recall, macro_f05_ceiling).
+    """
+    cand_map = {sid: {rid for rid, _ in lst} for sid, lst in candidates.items()}
+    tp = tot = 0
+    ceil_total = 0.0
+    for sid, truth in truth_map.items():
+        got = cand_map.get(sid, set()) & truth
+        tp += len(got)
+        tot += len(truth)
+        # best achievable: predict exactly the retrieved truth (perfect precision) -> its F0.5
+        ceil_total += f_beta_entity(got, truth)
+    micro = tp / tot if tot else 1.0
+    macro_ceil = ceil_total / len(truth_map) if truth_map else 1.0
+    return micro, macro_ceil
+
+
 def tune_threshold(pair_scores, pairs, truth_map, grid=None):
     """
     pair_scores: np.array probs; pairs: list[(s1,right)] aligned.
@@ -54,3 +74,33 @@ def tune_threshold(pair_scores, pairs, truth_map, grid=None):
         if f > best_f:
             best_f, best_t = f, float(t)
     return best_t, best_f
+
+
+def tune_threshold_by_country(pair_scores, pairs, truth_map, country_of, grid=None,
+                              min_s1=200, unseen_margin=0.10):
+    """
+    Country-specific decision boundaries (#3). Tune theta independently per country
+    (US=structured -> lower; India=noisy -> stricter). Countries with too few S1 fall back
+    to the global threshold. Returns (thr_by_country dict, global_thr, global_f05).
+    unseen (e.g. French test) countries get global_thr + unseen_margin -> counteract
+    uncalibrated overconfidence on distribution shift.
+    """
+    from collections import defaultdict
+    g_t, g_f = tune_threshold(pair_scores, pairs, truth_map, grid)
+    # split by country
+    idx_by_c = defaultdict(list)
+    for i, (sid, _rid) in enumerate(pairs):
+        idx_by_c[country_of.get(sid, "")].append(i)
+    thr = {}
+    ps = list(pair_scores)
+    for c, idxs in idx_by_c.items():
+        s1_here = {pairs[i][0] for i in idxs}
+        if len(s1_here) < min_s1:
+            thr[c] = g_t
+            continue
+        sub_scores = [ps[i] for i in idxs]
+        sub_pairs = [pairs[i] for i in idxs]
+        sub_truth = {sid: truth_map[sid] for sid in s1_here if sid in truth_map}
+        t_c, _ = tune_threshold(sub_scores, sub_pairs, sub_truth, grid)
+        thr[c] = t_c
+    return thr, g_t, g_f

@@ -34,15 +34,38 @@ NAME_ABBR = {
 }
 LEGAL_SUFFIX = {"corporation", "incorporated", "company", "limited", "private", "llp",
                 "llc", "plc", "gmbh", "srl", "sarl", "pte", "bv", "ag", "sa", "inc",
-                "ltd", "pvt", "co", "corp"}
+                "ltd", "pvt", "co", "corp",
+                # French legal entities (#4, unseen FR test)
+                "sas", "sasu", "sci", "eurl", "snc", "sca", "scs", "scop", "gie"}
 ADDR_ABBR = {
     "rd": "road", "st": "street", "str": "street", "ave": "avenue", "av": "avenue",
     "blvd": "boulevard", "ln": "lane", "dr": "drive", "ct": "court", "pl": "place",
     "sq": "square", "hwy": "highway", "pkwy": "parkway", "ter": "terrace",
-    "apt": "apartment", "ste": "suite", "fl": "floor", "bldg": "building",
-    "opp": "opposite", "nr": "near", "no": "number", "sec": "sector", "ph": "phase",
-    "blk": "block", "kh": "khasra", "po": "postoffice",
+    "apt": "apartment", "ste": "suite", "fl": "floor", "flr": "floor", "rm": "room",
+    "bldg": "building",
+    "opp": "opposite", "nr": "near", "nearby": "near", "no": "number", "num": "number",
+    "sec": "sector", "ph": "phase", "blk": "block", "kh": "khasra", "po": "postoffice",
+    # French street types (#4)
+    "bd": "boulevard", "bld": "boulevard", "imp": "impasse", "all": "allee",
+    "rte": "route", "che": "chemin", "sq.": "square",
 }
+# business-type words -> canonical type. Distinct types at same address are distinct
+# entities (ATM vs Bank, Clinic vs Hospital) (#15).
+ENTITY_TYPES = {
+    "atm": "atm", "bank": "bank", "hospital": "hospital", "clinic": "clinic",
+    "pharmacy": "pharmacy", "chemist": "pharmacy", "medical": "clinic",
+    "hotel": "hotel", "lodge": "hotel", "restaurant": "restaurant", "cafe": "cafe",
+    "school": "school", "college": "college", "university": "college",
+    "store": "store", "mart": "store", "supermarket": "store", "mall": "mall",
+    "temple": "worship", "church": "worship", "mosque": "worship",
+    "petrol": "fuel", "fuel": "fuel", "station": "station", "office": "office",
+    "factory": "factory", "warehouse": "warehouse", "showroom": "showroom",
+    "salon": "salon", "gym": "gym", "hostel": "hostel",
+}
+# French postal artifacts to strip (no entity signal) (#4)
+_fr_postal = re.compile(r"\b(cedex|bp|cs|tsa)\b\s*\d*", re.IGNORECASE)
+# French ordinal building subdivisions -> glue to preceding number: "12 bis" -> "12bis" (#4)
+_fr_ordinal = re.compile(r"\b(\d+)\s+(bis|ter|quater|quinquies)\b", re.IGNORECASE)
 US_STATES = {
     "al":"alabama","ak":"alaska","az":"arizona","ar":"arkansas","ca":"california","co":"colorado",
     "ct":"connecticut","de":"delaware","fl":"florida","ga":"georgia","hi":"hawaii","id":"idaho",
@@ -73,6 +96,9 @@ _repeat = re.compile(r"(.)\1{2,}")
 _pin_in = re.compile(r"\b(\d{6})\b")
 _zip_us = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
 _num = re.compile(r"\b\d+[a-z]?\b")
+_tld = re.compile(r"\.(com|net|org|in|co|io|biz|info|us|co\.in|org\.in)\b", re.IGNORECASE)
+_phone = re.compile(r"\b\d{7,}\b")          # phone-like long digit runs (not house/pin)
+_domain_tokens = {"com", "net", "org", "io", "biz", "info", "www"}
 
 
 def _basic(s: str) -> str:
@@ -85,7 +111,7 @@ def _basic(s: str) -> str:
 
 # ------------------------------------------------------------------ NAME field
 def norm_name(raw: str) -> dict:
-    core_src = raw or ""
+    core_src = _tld.sub(" ", raw or "")          # strip domain TLDs (maurewilliams.com -> maurewilliams)
     if _HAS_CLEANCO:
         try:
             core_src = _cleanco_basename(core_src) or core_src   # drop legal suffixes across countries
@@ -93,10 +119,12 @@ def norm_name(raw: str) -> dict:
             pass
     b_full = _basic(raw)
     b_core = _basic(core_src)
-    toks_full = [NAME_ABBR.get(t, t) for t in b_full.split()]
-    core = [t for t in (NAME_ABBR.get(t, t) for t in b_core.split()) if t not in LEGAL_SUFFIX]
+    toks_full = [NAME_ABBR.get(t, t) for t in b_full.split() if t not in _domain_tokens]
+    core = [t for t in (NAME_ABBR.get(t, t) for t in b_core.split())
+            if t not in LEGAL_SUFFIX and t not in _domain_tokens]
     suffixes = sorted({t for t in toks_full if t in LEGAL_SUFFIX})
     core_str = " ".join(core) if core else b_full
+    types = sorted({ENTITY_TYPES[t] for t in toks_full if t in ENTITY_TYPES})
     return {
         "name_norm": " ".join(toks_full),
         "name_core": core_str,
@@ -104,6 +132,7 @@ def norm_name(raw: str) -> dict:
         "name_acronym": "".join(w[0] for w in core_str.split() if w),
         "name_suffix": " ".join(suffixes),
         "name_nospace": core_str.replace(" ", ""),
+        "name_type": " ".join(types),          # business type(s) for distinct-entity guard (#15)
     }
 
 
@@ -121,14 +150,17 @@ def norm_address(raw: str, country: str = "US") -> dict:
             base = raw
     else:
         base = raw
+    base = _fr_ordinal.sub(r"\1\2", base or "")   # "12 bis" -> "12bis" (distinct adjacent buildings) (#4)
+    base = _fr_postal.sub(" ", base)              # strip CEDEX/BP/CS artifacts (#4)
     b = _basic(base).replace(" null ", " ").replace("null", " ")
-    toks = [_canon_state(ADDR_ABBR.get(t, t), country) for t in b.split()]
-    txt = " ".join(toks)
     pin = ""
-    m = _pin_in.search(txt) or _zip_us.search(txt)
+    m = _pin_in.search(b) or _zip_us.search(b)
     if m:
         pin = m.group(1)
-    nums = set(_num.findall(txt))
+    b = _phone.sub(" ", b)                        # drop phone-like long digit runs (denoise)
+    toks = [_canon_state(ADDR_ABBR.get(t, t), country) for t in b.split()]
+    txt = " ".join(toks)
+    nums = {n for n in _num.findall(txt) if len(n) <= 6}   # house/plot numbers only
     comps = {}
     if _HAS_POSTAL and raw:
         try:

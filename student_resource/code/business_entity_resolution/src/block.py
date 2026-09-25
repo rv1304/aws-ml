@@ -4,6 +4,8 @@ Blockers (complementary):
   1. embedding ANN (LaBSE)      -> cross-language + semantic + typo tolerant
   2. char-ngram TF-IDF ANN      -> lexical overlap embeddings can miss
   3. phonetic-key block         -> heavy typos / transliteration
+  4. exact-key blocks           -> nospace-name / sorted-tokens / name+pin
+                                   (zero-recall-loss for clean dupes; ANN can rank them out)
 Output = candidate_pairs: dict[s1_id] -> list[(right_id, score)].
 This exact set is written to candidate_pairs.tsv (the last stage before matching).
 Recall ceiling vs candidate size is the blocking-prize tradeoff -> measured in pipeline.
@@ -114,6 +116,44 @@ def generate_candidates(s1: "pd.DataFrame", right: "pd.DataFrame",
         for j in buckets.get(key, [])[:k]:
             rid = r_ids[j]
             row.setdefault(rid, 0.5)
+
+    # 4) exact-key blocks -> guarantee clean dupes survive (ANN can rank them out of top-k).
+    #    high seed score so resolve/matcher see them as strong candidates.
+    def _exact_block(key_fn, seed_score):
+        b = defaultdict(list)
+        for j in range(len(r_ids)):
+            key = key_fn(right, j)
+            if key:
+                b[key].append(j)
+        for i in range(len(s1_ids)):
+            key = key_fn(s1, i)
+            if not key:
+                continue
+            row = cand[s1_ids[i]]
+            for j in b.get(key, [])[:k]:
+                rid = r_ids[j]
+                if seed_score > row.get(rid, -1):
+                    row[rid] = seed_score
+
+    nosp_s1, nosp_r = s1.get("name_nospace"), right.get("name_nospace")
+    if nosp_s1 is not None and nosp_r is not None:
+        nv1, nv2 = nosp_s1.to_numpy(), nosp_r.to_numpy()
+        _exact_block(lambda df, j: (nv1 if df is s1 else nv2)[j] or "", 0.99)
+
+    nc_s1, nc_r = s1["name_core"].to_numpy(), right["name_core"].to_numpy()
+    _exact_block(lambda df, j: " ".join(sorted((nc_s1 if df is s1 else nc_r)[j].split())), 0.95)
+
+    pin_s1, pin_r = s1.get("addr_pin"), right.get("addr_pin")
+    if pin_s1 is not None and pin_r is not None:
+        pv1, pv2 = pin_s1.to_numpy(), pin_r.to_numpy()
+
+        def _name_pin(df, j):
+            nc = (nc_s1 if df is s1 else nc_r)[j]
+            pv = (pv1 if df is s1 else pv2)[j]
+            toks = nc.split()
+            return f"{toks[0]}|{pv}" if toks and pv else ""
+
+        _exact_block(_name_pin, 0.9)
 
     # finalize: sort by score desc, cap
     out = {}

@@ -17,7 +17,7 @@ from . import ingest, block, features, matcher, resolve, score
 from .embed import Embedder
 
 REC_FIELDS = ["name_core", "name_sorted", "name_acronym", "name_suffix", "name_nospace",
-              "addr_norm", "addr_pin", "addr_nums", "addr_tokens"]
+              "name_type", "addr_norm", "addr_pin", "addr_nums", "addr_tokens"]
 
 
 # ------------------------------------------------------------------- helpers
@@ -86,6 +86,7 @@ def run_dev(sample_s1: int = 20000, sample_right: int | None = None):
     embedder = Embedder()
     Xtr, ytr, Xva, pva = [], [], [], []
     truth_val = {}
+    val_cands = {}   # for blocking-recall ceiling
 
     for c in _countries(s1):
         rc = _slice_country(right, c)
@@ -103,20 +104,27 @@ def run_dev(sample_s1: int = 20000, sample_right: int | None = None):
             if len(X):
                 Xtr.append(X); ytr.append(y)
         if len(val_c):
-            _, X, pr, y, _ = _candidates_and_features(val_c, rc, embedder, f"trval_{c}", gt)
+            cands, X, pr, y, _ = _candidates_and_features(val_c, rc, embedder, f"trval_{c}", gt)
             if len(X):
                 Xva.append(X); pva.extend(pr)
+            val_cands.update(cands)
             for sid in val_c["entity_id"]:
                 truth_val[sid] = gt.get(sid, set())
         del rc; gc.collect()
 
     Xtr = np.vstack(Xtr); ytr = np.concatenate(ytr)
     print(f"[dev] train pairs={len(ytr)} pos_rate={ytr.mean():.3f}")
+    # HARD CEILING: what blocking retrieved. Matcher cannot beat this.
+    micro_r, macro_ceil = score.candidate_recall(val_cands, truth_val)
+    print(f"[dev] blocking recall={micro_r:.4f}  macro F_0.5 CEILING={macro_ceil:.4f}  "
+          f"<- max reachable; if this < target, fix blocking, not matcher")
     mdl = matcher.Matcher().train(Xtr, ytr)
     Xva = np.vstack(Xva) if Xva else np.zeros((0, Xtr.shape[1]), "float32")
     pscore = mdl.predict(Xva)
     t, f = score.tune_threshold(pscore, pva, truth_val)
-    print(f"[dev] BEST threshold={t}  macro F_0.5={f:.4f}  (val S1={len(truth_val)})")
+    gap = macro_ceil - f
+    print(f"[dev] BEST threshold={t}  macro F_0.5={f:.4f}  (val S1={len(truth_val)})  "
+          f"gap-to-ceiling={gap:.4f}  ({'matcher-bound' if gap > 0.005 else 'blocking-bound'})")
     return t, f
 
 
@@ -136,6 +144,7 @@ def run_full(train_sample: int = 200000):
 
     Xtr, ytr, Xho, pho = [], [], [], []
     truth_ho = {}
+    country_of = {}      # s1_id -> country, for per-country threshold tuning (#3)
     for c in _countries(s1):
         rc = _slice_country(right, c)
         s1c = _slice_country(s1, c)
@@ -147,15 +156,20 @@ def run_full(train_sample: int = 200000):
         if len(ho_c):
             _, X, pr, y, _ = _candidates_and_features(ho_c, rc, embedder, f"fho_{c}", gt)
             if len(X): Xho.append(X); pho.extend(pr)
-            for sid in ho_c["entity_id"]: truth_ho[sid] = gt.get(sid, set())
+            for sid in ho_c["entity_id"]:
+                truth_ho[sid] = gt.get(sid, set())
+                country_of[sid] = c
         del rc; gc.collect()
     Xtr = np.vstack(Xtr); ytr = np.concatenate(ytr)
     mdl = matcher.Matcher().train(Xtr, ytr)
     mdl.save(CFG.w("matcher_lgbm.txt"))
     thr = CFG.threshold
+    thr_by_c, unseen_margin = {}, 0.10
     if Xho:
-        thr, f = score.tune_threshold(mdl.predict(np.vstack(Xho)), pho, truth_ho)
-        print(f"[full] tuned threshold={thr}  holdout F_0.5={f:.4f}")
+        thr_by_c, thr, f = score.tune_threshold_by_country(
+            mdl.predict(np.vstack(Xho)), pho, truth_ho, country_of)
+        print(f"[full] global threshold={thr}  holdout F_0.5={f:.4f}")
+        print(f"[full] per-country thresholds={ {k: round(v,3) for k,v in thr_by_c.items()} }")
     del s1, right, gt; gc.collect()
 
     # ---- 2) run TEST ----
@@ -169,9 +183,19 @@ def run_full(train_sample: int = 200000):
         cands, X, pairs, _, rec = _candidates_and_features(s1c, rc, embedder, f"test_{c}")
         p = mdl.predict(X)
         if CFG.use_cross_encoder:
-            ce = matcher.cross_encoder_scores(pairs, rec)
-            p = matcher.blend(p, ce)
-        mm = resolve.resolve(pairs, p, thr, rec, CFG.enforce_one_s1)
+            # #14 selective rescoring: only run the heavy cross-encoder on BORDERLINE pairs
+            # (gbdt prob in [0.55,0.80]) where it acts as tie-breaker. Confident pairs untouched.
+            band = [i for i, s in enumerate(p) if 0.55 <= s <= 0.80]
+            if band:
+                sub_pairs = [pairs[i] for i in band]
+                ce = matcher.cross_encoder_scores(sub_pairs, rec)
+                blended = matcher.blend(p[band], ce)
+                for k, i in enumerate(band):
+                    p[i] = blended[k]
+        # #3 per-country theta; unseen country (e.g. French) -> stricter (global + margin)
+        thr_c = thr_by_c.get(c, min(thr + unseen_margin, 0.95))
+        print(f"[full] country={c} threshold={thr_c:.3f}{' (unseen->strict)' if c not in thr_by_c else ''}")
+        mm = resolve.resolve(pairs, p, thr_c, rec, CFG.enforce_one_s1)
         match_map.update(mm)
         for sid, lst in cands.items():
             cand_map[sid] = {rid for rid, _ in lst}

@@ -43,14 +43,44 @@ def resolve(pairs, scores, threshold, rec_lookup, enforce_one_s1=True):
             if cur is None or sc > cur[0]:
                 best_owner[rid] = (sc, sid)
         out = defaultdict(set)
+        scored = defaultdict(list)   # s1_id -> [(rid, score)] for triangle prune
         for rid, (sc, sid) in best_owner.items():
             out[sid].add(rid)
-        return dict(out)
+            scored[sid].append((rid, sc))
+        return _triangle_prune(dict(out), scored, rec_lookup)
 
     out = defaultdict(set)
+    scored = defaultdict(list)
     for sid, rid, sc in kept:
         out[sid].add(rid)
-    return dict(out)
+        scored[sid].append((rid, sc))
+    return _triangle_prune(dict(out), scored, rec_lookup)
+
+
+def _triangle_prune(out, scored, rec_lookup, tau: int = 85):
+    """
+    Triangle-inequality pruning (#2). If an S1 owns >1 right, the rights should also be
+    similar to EACH OTHER (they're the same real business). Anchor = highest-score right;
+    drop any co-member whose name is dissimilar to the anchor (< tau) -> kills false merges
+    where two distinct businesses both got attached to one S1.
+    """
+    for sid, rids in list(out.items()):
+        if len(rids) < 2:
+            continue
+        members = sorted(scored[sid], key=lambda x: -x[1])   # by score desc
+        anchor = members[0][0]
+        a_rec = rec_lookup.get(anchor)
+        if a_rec is None:
+            continue
+        keep = {anchor}
+        for rid, _sc in members[1:]:
+            r = rec_lookup.get(rid)
+            if r is None:
+                continue
+            if fuzz.token_set_ratio(a_rec["name_core"], r["name_core"]) >= tau:
+                keep.add(rid)
+        out[sid] = keep
+    return out
 
 
 def to_submission_rows(all_s1_ids, match_map):

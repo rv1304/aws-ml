@@ -38,7 +38,7 @@ class Config:
     embed_dim_reduce: int = 0            # 0 = keep full dim; else PCA to this many dims (memory on low-RAM)
 
     # ---- blocking ----
-    top_k: int = int(os.environ.get("TOP_K", 25))     # candidates kept per S1 (per blocker), then unioned
+    top_k: int = int(os.environ.get("TOP_K", 50))     # candidates kept per S1 (per blocker), then unioned
     tfidf_ngram: tuple = (2, 4)
     tfidf_max_features: int = 2 ** 20
     ivf_threshold: int = 1_500_000       # right-pool size above which faiss uses IVF instead of Flat
