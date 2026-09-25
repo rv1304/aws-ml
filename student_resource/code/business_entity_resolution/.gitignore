@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+artifacts/
+output/
+*.npy
+*.txt.model
+.DS_Store

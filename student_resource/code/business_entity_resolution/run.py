@@ -15,7 +15,12 @@ Env toggles (see src/config.py):
   EMBED_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2  lighter model
 """
 import argparse
-import sys, os
+import sys, os, platform
+# ---- native-lib safety (must run BEFORE importing faiss/torch/lightgbm) ----
+# macOS ships duplicate OpenMP runtimes (libomp via torch + faiss + lightgbm) -> segfault.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+if platform.system() == "Darwin":
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.pipeline import run_dev, run_full
