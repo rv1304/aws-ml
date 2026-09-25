@@ -1,0 +1,29 @@
+# ---- core ----
+pandas==2.2.2
+numpy==1.26.4
+scipy==1.13.1
+scikit-learn==1.5.1
+tqdm==4.66.4
+
+# ---- string / fuzzy / phonetic ----
+rapidfuzz==3.9.6
+jellyfish==1.1.0
+Unidecode==1.3.8
+cleanco==2.3               # company legal-suffix normalization (multi-country)
+
+# ---- blocking / ANN ----
+faiss-cpu==1.8.0           # use faiss-gpu on a CUDA box instead
+datasketch==1.6.5          # MinHash-LSH blocking
+
+# ---- matcher ----
+lightgbm==4.5.0
+xgboost==2.1.1
+catboost==1.2.5
+networkx==3.3
+
+# ---- embeddings / cross-encoder (GPU strongly recommended) ----
+torch==2.3.1               # install the CUDA build on your 4060/AWS box
+sentence-transformers==3.0.1   # LaBSE, multilingual-e5, cross-encoder (all MIT/Apache)
+
+# ---- OPTIONAL, best-in-class address parsing (needs system libpostal + ~2GB model) ----
+# postal==1.1.10           # pip install AFTER building libpostal C lib (see README)
