@@ -62,18 +62,26 @@ def tune_threshold(pair_scores, pairs, truth_map, grid=None):
     """
     import numpy as np
     from collections import defaultdict
-    if grid is None:
-        grid = np.round(np.arange(0.10, 0.96, 0.02), 3)
     by_s1 = defaultdict(list)
     for (sid, rid), sc in zip(pairs, pair_scores):
         by_s1[sid].append((rid, float(sc)))
-    best_t, best_f = 0.5, -1.0
-    for t in grid:
-        pred = {sid: {rid for rid, sc in lst if sc >= t} for sid, lst in by_s1.items()}
-        f = macro_f05(pred, truth_map)
-        if f > best_f:
-            best_f, best_t = f, float(t)
-    return best_t, best_f
+
+    def _best(cand_grid):
+        bt, bf = 0.5, -1.0
+        for t in cand_grid:
+            pred = {sid: {rid for rid, sc in lst if sc >= t} for sid, lst in by_s1.items()}
+            f = macro_f05(pred, truth_map)
+            if f > bf:
+                bf, bt = f, float(t)
+        return bt, bf
+
+    if grid is not None:
+        return _best(grid)
+    # two-stage: coarse sweep, then refine at 0.005 around the winner
+    coarse = np.round(np.arange(0.10, 0.96, 0.02), 3)
+    t0, _ = _best(coarse)
+    fine = np.round(np.arange(max(t0 - 0.02, 0.01), min(t0 + 0.02, 0.99) + 1e-9, 0.005), 3)
+    return _best(fine)
 
 
 def tune_threshold_by_country(pair_scores, pairs, truth_map, country_of, grid=None,

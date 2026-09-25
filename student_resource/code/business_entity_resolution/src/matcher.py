@@ -15,6 +15,8 @@ class Matcher:
     def __init__(self, ensemble: bool = True):
         self.ensemble = ensemble
         self.models = []
+        self.meta = None      # optional logistic stacker over per-model probas
+        self.cal = None       # optional isotonic calibrator on final prob
 
     def train(self, X, y):
         pos = max(int(y.sum()), 1)
@@ -57,11 +59,56 @@ class Matcher:
                 print(f"[catboost skipped: {e}]")
         return self
 
+    def _matrix(self, X) -> np.ndarray:
+        """Per-model probability matrix, shape (n, n_models)."""
+        return np.column_stack([m.predict_proba(X)[:, 1] for _, m in self.models])
+
+    def fit_meta(self, Xcal, ycal):
+        """
+        Leakage-safe stacking: learn a logistic blend of the base-model probas on a
+        HELD-OUT labeled slice (never Xtr). Beats plain mean when models disagree
+        per-country. No-op with a single base model.
+        """
+        if len(self.models) < 2 or len(Xcal) == 0 or len(set(ycal.tolist())) < 2:
+            return self
+        try:
+            from sklearn.linear_model import LogisticRegression
+            P = self._matrix(Xcal)
+            self.meta = LogisticRegression(max_iter=1000, C=1.0).fit(P, ycal)
+        except Exception as e:
+            print(f"[meta skipped: {e}]")
+            self.meta = None
+        return self
+
+    def calibrate(self, Xcal, ycal):
+        """
+        Isotonic calibration on the held-out slice so probabilities mean what they say.
+        Monotone -> preserves ranking, but makes per-country thresholds, the unseen-country
+        margin, and cross-encoder blending principled instead of ad-hoc.
+        """
+        if len(Xcal) == 0 or len(set(ycal.tolist())) < 2:
+            return self
+        try:
+            from sklearn.isotonic import IsotonicRegression
+            raw = self._blend_base(self._matrix(Xcal))
+            self.cal = IsotonicRegression(out_of_bounds="clip").fit(raw, ycal)
+        except Exception as e:
+            print(f"[calibration skipped: {e}]")
+            self.cal = None
+        return self
+
+    def _blend_base(self, P: np.ndarray) -> np.ndarray:
+        if self.meta is not None:
+            return self.meta.predict_proba(P)[:, 1].astype("float32")
+        return P.mean(axis=1).astype("float32")
+
     def predict(self, X) -> np.ndarray:
         if len(X) == 0:
             return np.zeros(0, dtype="float32")
-        preds = [m.predict_proba(X)[:, 1] for _, m in self.models]
-        return np.mean(preds, axis=0).astype("float32")
+        p = self._blend_base(self._matrix(X))
+        if self.cal is not None:
+            p = self.cal.transform(p).astype("float32")
+        return p
 
     # single-model save/load for the primary lgbm (full ensemble is retrained per run)
     def save(self, path):

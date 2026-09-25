@@ -12,11 +12,26 @@ from rapidfuzz import fuzz
 
 
 def _veto(r1, r2) -> bool:
+    # entity-type conflict (ATM vs Bank, Store vs Warehouse) -> distinct business.
+    # Checked FIRST and NOT overridable by name: same-brand different-type is the exact trap
+    # (an ATM and its parent branch always share the brand name).
+    ty1 = set(r1.get("name_type", "").split())
+    ty2 = set(r2.get("name_type", "").split())
+    if ty1 and ty2 and not (ty1 & ty2):
+        return True
+    name_sim = fuzz.token_set_ratio(r1["name_core"], r2["name_core"])
+    # near-identical names override the remaining location vetoes (brand w/ dirty address /
+    # data-entry error) -> avoids splitting a real match on a typo'd PIN.
+    if name_sim >= 95:
+        return False
+    # contradicting PINs -> different location
     p1, p2 = r1.get("addr_pin", ""), r2.get("addr_pin", "")
     if p1 and p2 and p1 != p2:
-        # allow only if name is essentially identical (same brand, data-entry pin error)
-        if fuzz.token_set_ratio(r1["name_core"], r2["name_core"]) < 95:
-            return True
+        return True
+    # disjoint house numbers with a decent-but-not-identical name -> distinct branch/chain trap
+    nm1, nm2 = r1.get("addr_nums", set()), r2.get("addr_nums", set())
+    if nm1 and nm2 and not (nm1 & nm2) and name_sim < 90:
+        return True
     return False
 
 

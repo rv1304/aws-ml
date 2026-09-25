@@ -45,6 +45,20 @@ def _slice_country(df: pd.DataFrame, country: str) -> pd.DataFrame:
     return df
 
 
+def _split_by_s1(pairs, frac: float = 0.5, seed: int = CFG.seed):
+    """
+    Split a labeled pair set into (calibrate_idx, tune_idx) by S1 id so no S1 leaks
+    across the two halves. Half fits the stacker+calibrator, half tunes thresholds.
+    """
+    sids = sorted({s for s, _ in pairs})
+    rng = np.random.RandomState(seed); rng.shuffle(sids)
+    cal_s = set(sids[:int(len(sids) * frac)])
+    cal_idx, tune_idx = [], []
+    for i, (s, _) in enumerate(pairs):
+        (cal_idx if s in cal_s else tune_idx).append(i)
+    return cal_idx, tune_idx
+
+
 # --------------------------------------------------- candidate+feature+score
 def _candidates_and_features(s1c, rightc, embedder, tag, gt=None):
     emb_s1 = _embed(s1c, f"{tag}_s1", embedder)
@@ -84,7 +98,7 @@ def run_dev(sample_s1: int = 20000, sample_right: int | None = None):
         need_right |= gt.get(sid, set())
 
     embedder = Embedder()
-    Xtr, ytr, Xva, pva = [], [], [], []
+    Xtr, ytr, Xva, pva, yva = [], [], [], [], []
     truth_val = {}
     val_cands = {}   # for blocking-recall ceiling
 
@@ -106,7 +120,7 @@ def run_dev(sample_s1: int = 20000, sample_right: int | None = None):
         if len(val_c):
             cands, X, pr, y, _ = _candidates_and_features(val_c, rc, embedder, f"trval_{c}", gt)
             if len(X):
-                Xva.append(X); pva.extend(pr)
+                Xva.append(X); pva.extend(pr); yva.append(y)
             val_cands.update(cands)
             for sid in val_c["entity_id"]:
                 truth_val[sid] = gt.get(sid, set())
@@ -120,8 +134,16 @@ def run_dev(sample_s1: int = 20000, sample_right: int | None = None):
           f"<- max reachable; if this < target, fix blocking, not matcher")
     mdl = matcher.Matcher().train(Xtr, ytr)
     Xva = np.vstack(Xva) if Xva else np.zeros((0, Xtr.shape[1]), "float32")
-    pscore = mdl.predict(Xva)
-    t, f = score.tune_threshold(pscore, pva, truth_val)
+    yva = np.concatenate(yva) if yva else np.zeros(0, "int8")
+    # leakage-safe: fit stacker+calibrator on half of val, tune threshold on the other half
+    cal_idx, tune_idx = _split_by_s1(pva)
+    if cal_idx:
+        mdl.fit_meta(Xva[cal_idx], yva[cal_idx]).calibrate(Xva[cal_idx], yva[cal_idx])
+    tune_pairs = [pva[i] for i in tune_idx] or pva
+    tune_X = Xva[tune_idx] if tune_idx else Xva
+    tune_truth = {s: truth_val[s] for s in {p[0] for p in tune_pairs} if s in truth_val}
+    pscore = mdl.predict(tune_X)
+    t, f = score.tune_threshold(pscore, tune_pairs, tune_truth)
     gap = macro_ceil - f
     print(f"[dev] BEST threshold={t}  macro F_0.5={f:.4f}  (val S1={len(truth_val)})  "
           f"gap-to-ceiling={gap:.4f}  ({'matcher-bound' if gap > 0.005 else 'blocking-bound'})")
@@ -142,7 +164,7 @@ def run_full(train_sample: int = 200000):
     hold = set(s1["entity_id"]) - keep
     hold = set(list(hold)[:max(len(keep) // 5, 1)])
 
-    Xtr, ytr, Xho, pho = [], [], [], []
+    Xtr, ytr, Xho, pho, yho = [], [], [], [], []
     truth_ho = {}
     country_of = {}      # s1_id -> country, for per-country threshold tuning (#3)
     for c in _countries(s1):
@@ -155,7 +177,7 @@ def run_full(train_sample: int = 200000):
             if len(X): Xtr.append(X); ytr.append(y)
         if len(ho_c):
             _, X, pr, y, _ = _candidates_and_features(ho_c, rc, embedder, f"fho_{c}", gt)
-            if len(X): Xho.append(X); pho.extend(pr)
+            if len(X): Xho.append(X); pho.extend(pr); yho.append(y)
             for sid in ho_c["entity_id"]:
                 truth_ho[sid] = gt.get(sid, set())
                 country_of[sid] = c
@@ -166,9 +188,19 @@ def run_full(train_sample: int = 200000):
     thr = CFG.threshold
     thr_by_c, unseen_margin = {}, 0.10
     if Xho:
+        Xho = np.vstack(Xho); yho = np.concatenate(yho)
+        # leakage-safe: half of holdout fits stacker+calibrator, half tunes thresholds
+        cal_idx, tune_idx = _split_by_s1(pho)
+        if cal_idx:
+            mdl.fit_meta(Xho[cal_idx], yho[cal_idx]).calibrate(Xho[cal_idx], yho[cal_idx])
+        t_pairs = [pho[i] for i in tune_idx] or pho
+        t_X = Xho[tune_idx] if tune_idx else Xho
+        t_truth = {s: truth_ho[s] for s in {p[0] for p in t_pairs} if s in truth_ho}
         thr_by_c, thr, f = score.tune_threshold_by_country(
-            mdl.predict(np.vstack(Xho)), pho, truth_ho, country_of)
-        print(f"[full] global threshold={thr}  holdout F_0.5={f:.4f}")
+            mdl.predict(t_X), t_pairs, t_truth, country_of)
+        print(f"[full] global threshold={thr}  holdout F_0.5={f:.4f}  "
+              f"(stacker={'on' if mdl.meta is not None else 'off'} "
+              f"calib={'on' if mdl.cal is not None else 'off'})")
         print(f"[full] per-country thresholds={ {k: round(v,3) for k,v in thr_by_c.items()} }")
     del s1, right, gt; gc.collect()
 
@@ -182,18 +214,19 @@ def run_full(train_sample: int = 200000):
         rc = _slice_country(rightt, c)
         cands, X, pairs, _, rec = _candidates_and_features(s1c, rc, embedder, f"test_{c}")
         p = mdl.predict(X)
+        # #3 per-country theta; unseen country (e.g. French) -> stricter (global + margin)
+        thr_c = thr_by_c.get(c, min(thr + unseen_margin, 0.95))
         if CFG.use_cross_encoder:
-            # #14 selective rescoring: only run the heavy cross-encoder on BORDERLINE pairs
-            # (gbdt prob in [0.55,0.80]) where it acts as tie-breaker. Confident pairs untouched.
-            band = [i for i, s in enumerate(p) if 0.55 <= s <= 0.80]
+            # #14 selective rescoring: run the heavy cross-encoder ONLY on pairs near this
+            # country's decision boundary, where it breaks ties. Confident pairs untouched.
+            lo, hi = max(thr_c - 0.15, 0.0), min(thr_c + 0.10, 1.0)
+            band = [i for i, s in enumerate(p) if lo <= s <= hi]
             if band:
                 sub_pairs = [pairs[i] for i in band]
                 ce = matcher.cross_encoder_scores(sub_pairs, rec)
                 blended = matcher.blend(p[band], ce)
                 for k, i in enumerate(band):
                     p[i] = blended[k]
-        # #3 per-country theta; unseen country (e.g. French) -> stricter (global + margin)
-        thr_c = thr_by_c.get(c, min(thr + unseen_margin, 0.95))
         print(f"[full] country={c} threshold={thr_c:.3f}{' (unseen->strict)' if c not in thr_by_c else ''}")
         mm = resolve.resolve(pairs, p, thr_c, rec, CFG.enforce_one_s1)
         match_map.update(mm)
